@@ -84,7 +84,7 @@ class StateStore:
                 name TEXT NOT NULL,
                 dob TEXT NOT NULL,
                 address TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL,
                 phone TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0,
