@@ -12,6 +12,8 @@ current.json
 # Bulk signup runner data files
 *.csv
 signup_state.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
