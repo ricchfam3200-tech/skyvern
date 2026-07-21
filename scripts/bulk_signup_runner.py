@@ -242,7 +242,7 @@ async def run_batch(
     concurrency: int,
     max_steps: int,
 ) -> None:
-    skyvern = Skyvern.local(llm_config=LLM_CONFIG, use_in_memory_db=False)
+    skyvern = Skyvern.local(llm_config=LLM_CONFIG, use_in_memory_db=True)
     semaphore = asyncio.Semaphore(concurrency)
     try:
         await asyncio.gather(*(process_row(skyvern, row, store, max_steps, semaphore) for row in rows))
