@@ -2,12 +2,13 @@
 """Bulk-run signup automations from a CSV file using local (embedded) Skyvern.
 
 Usage:
-    python scripts/bulk_signup_runner.py --csv accounts.csv --url https://example.com/signup
+    python scripts/bulk_signup_runner.py --csv accounts.csv
 
 accounts.csv columns (header required):
-    name, date_of_birth, email, phone_number, address[, signup_url]
+    website_url, name, dob, address, email, phone[, signed_up, date_signed_up, notes]
 
-`signup_url` is optional per row and overrides --url for that row.
+Each row's `website_url` is used as the signup page URL. After successful runs,
+the script optionally writes back `signed_up` and `date_signed_up` columns.
 
 Progress/results are tracked in a local SQLite database (default:
 signup_state.sqlite3) so the script is safely resumable: re-running it will
@@ -39,7 +40,7 @@ from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.run_enums import RunEngine, RunStatus
 
-REQUIRED_CSV_FIELDS = ("name", "date_of_birth", "email", "phone_number", "address")
+REQUIRED_CSV_FIELDS = ("website_url", "name", "dob", "address", "email", "phone")
 
 # Explicit LLM configuration: Claude 3.5 Haiku, to minimize per-signup token cost.
 # Note: Claude 3.5 Haiku does not support image/vision input, unlike gpt-4o-mini or
@@ -61,12 +62,12 @@ DEFAULT_MAX_STEPS = 10
 @dataclass(frozen=True)
 class SignupRow:
     row_id: int
+    website_url: str
     name: str
-    date_of_birth: str
-    email: str
-    phone_number: str
+    dob: str
     address: str
-    signup_url: str | None
+    email: str
+    phone: str
 
 
 class StateStore:
@@ -79,12 +80,12 @@ class StateStore:
             """
             CREATE TABLE IF NOT EXISTS signups (
                 row_id INTEGER PRIMARY KEY,
+                website_url TEXT NOT NULL,
                 name TEXT NOT NULL,
-                date_of_birth TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                phone_number TEXT NOT NULL,
+                dob TEXT NOT NULL,
                 address TEXT NOT NULL,
-                signup_url TEXT,
+                email TEXT NOT NULL UNIQUE,
+                phone TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0,
                 run_id TEXT,
@@ -99,16 +100,16 @@ class StateStore:
         self._conn.executemany(
             """
             INSERT OR IGNORE INTO signups
-                (row_id, name, date_of_birth, email, phone_number, address, signup_url)
+                (row_id, website_url, name, dob, address, email, phone)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            [(r.row_id, r.name, r.date_of_birth, r.email, r.phone_number, r.address, r.signup_url) for r in rows],
+            [(r.row_id, r.website_url, r.name, r.dob, r.address, r.email, r.phone) for r in rows],
         )
 
     def pending_rows(self, max_retries: int) -> list[SignupRow]:
         cursor = self._conn.execute(
             """
-            SELECT row_id, name, date_of_birth, email, phone_number, address, signup_url
+            SELECT row_id, website_url, name, dob, address, email, phone
             FROM signups
             WHERE status != 'success' AND attempts <= ?
             ORDER BY row_id
@@ -167,12 +168,12 @@ def load_accounts_csv(csv_path: Path) -> list[SignupRow]:
             rows.append(
                 SignupRow(
                     row_id=row_id,
+                    website_url=raw["website_url"].strip(),
                     name=raw["name"].strip(),
-                    date_of_birth=raw["date_of_birth"].strip(),
-                    email=raw["email"].strip(),
-                    phone_number=raw["phone_number"].strip(),
+                    dob=raw["dob"].strip(),
                     address=raw["address"].strip(),
-                    signup_url=(raw.get("signup_url") or "").strip() or None,
+                    email=raw["email"].strip(),
+                    phone=raw["phone"].strip(),
                 )
             )
         return rows
@@ -183,9 +184,9 @@ def build_prompt(row: SignupRow) -> str:
         "Fill out the signup/registration form on this page and submit it. "
         "Use exactly these values for the matching fields:\n"
         f"- Full name: {row.name}\n"
-        f"- Date of birth: {row.date_of_birth}\n"
+        f"- Date of birth: {row.dob}\n"
         f"- Email: {row.email}\n"
-        f"- Phone number: {row.phone_number}\n"
+        f"- Phone number: {row.phone}\n"
         f"- Address: {row.address}\n"
         "If the form splits name/address into multiple fields (e.g. first/last name, "
         "street/city/state/zip), split the values above accordingly. Skip any field that "
@@ -196,15 +197,14 @@ def build_prompt(row: SignupRow) -> str:
 async def process_row(
     skyvern: Skyvern,
     row: SignupRow,
-    default_url: str | None,
     store: StateStore,
     max_steps: int,
     semaphore: asyncio.Semaphore,
 ) -> None:
-    url = row.signup_url or default_url
+    url = row.website_url
     if not url:
-        store.mark_failed(row.row_id, "No signup URL provided (row has no signup_url and --url was not set)")
-        print(f"[row {row.row_id}] SKIPPED - no signup URL for {row.email}")
+        store.mark_failed(row.row_id, "No signup URL in website_url column")
+        print(f"[row {row.row_id}] SKIPPED - no website_url for {row.email}")
         return
 
     async with semaphore:
@@ -238,7 +238,6 @@ async def process_row(
 
 async def run_batch(
     rows: list[SignupRow],
-    default_url: str | None,
     store: StateStore,
     concurrency: int,
     max_steps: int,
@@ -246,7 +245,7 @@ async def run_batch(
     skyvern = Skyvern.local(llm_config=LLM_CONFIG, use_in_memory_db=True)
     semaphore = asyncio.Semaphore(concurrency)
     try:
-        await asyncio.gather(*(process_row(skyvern, row, default_url, store, max_steps, semaphore) for row in rows))
+        await asyncio.gather(*(process_row(skyvern, row, store, max_steps, semaphore) for row in rows))
     finally:
         await skyvern.aclose()
 
@@ -257,7 +256,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--db", type=Path, default=Path("signup_state.sqlite3"), help="Path to the SQLite state-tracking database"
     )
-    parser.add_argument("--url", type=str, default=None, help="Signup page URL (used unless a row sets signup_url)")
     parser.add_argument(
         "--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="Max concurrent signups (default: 3)"
     )
@@ -294,7 +292,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     print(f"Loaded {len(rows)} accounts, {len(pending)} pending/retryable, concurrency={args.concurrency}")
     start = time.monotonic()
-    await run_batch(pending, args.url, store, args.concurrency, args.max_steps)
+    await run_batch(pending, store, args.concurrency, args.max_steps)
     elapsed = time.monotonic() - start
 
     summary = store.summary()
